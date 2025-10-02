@@ -1,0 +1,64 @@
+SESSION NOTES - Encoder & Motor Control
+======================================
+
+Hardware
+- Motor: JGB37-520B with encoder
+- Driver: DRV8871 (PWM-capable)
+- MCU: ESP32-S3
+
+Motor PWM (current best practice)
+- Frequency: 25 kHz (quiet, per DRV8871 datasheet)
+- Timer resolution: 10 MHz -> 400 ticks = 100% duty
+- Duty mapping: ticks = duty% * 4 (e.g., 70% -> 280/400)
+- Control stack: ESP-IDF bdc_motor (MCPWM backend)
+
+Encoder (working configuration)
+- GPIO: A=36, B=35
+- Pulses per rotation (PPR): 1,600 (empirical, current project meta)
+- PCNT: X4 quadrature using two channels (A/B) with complementary edge/level actions
+- Glitch filter: 10 us (good for hand rotation; reduce for higher speeds)
+- Verified: 1 manual rotation ~= 1,600 counts, rot_total ~= 1.00
+
+Lessons Learned
+- Initial undercount came from single-edge/single-channel counting
+- Correct quadrature requires two channels with complementary edge/level actions
+- Datasheet-driven PWM setup (25 kHz) avoids noise and aligns with driver capability
+- Keep PWM "ticks max" consistent with timer resolution/frequency
+
+PID (for speed control, to re-enable later)
+- Loop period: 10 ms
+- Target speed (for slow tuning): 3 pulses/10 ms
+- Parameters (last stable set): Kp=0.3, Ki=0.1, Kd=0.05, integral clamp +-200
+- Output clamp: 0–400 ticks (maps to 0–100% at 25 kHz)
+
+Minimal Encoder Logger (current test app)
+- Prints every ~200 ms: count, delta, direction, rot_total, rot_delta
+- Use this to validate encoder wiring, PPR, and direction
+
+Next Steps
+- Re-enable motor control with PWM + encoder + PID
+- Confirm duty-to-speed relation at multiple setpoints
+- Add position/rotation targets for precise movement sequences
+- Store calibration (PPR, direction) in config for reuse
+
+Quick Reference
+- One full rotation ~= 1,600 counts (current meta)
+- 100% duty = 400 ticks at 25 kHz with 10 MHz timer
+- Example duties: 50% -> 200 ticks, 70% -> 280 ticks, 80% -> 320 ticks
+
+Updates - 2025-09-19
+- PPR updated to 1,550 for this setup (target 5 rev = 7,750 pulses)
+- Added FreeRTOS task: drive forward until |count|/PPR >= 5.0, then stop
+- Stop method: set duty to 0 and coast (both GPIO 4 & 5 low)
+- Logs: now print PPR and target pulses, e.g., count, rot=..../5.00 (PPR=1550 target=7750)
+
+Updates - 2025-09-22
+- Added Motor 2 with same specs as Motor 1
+  - PWM: 25 kHz, 10 MHz timer resolution, 400 ticks = 100%
+  - PPR: 1,550 (shared `ENCODER_PULSES_PER_ROT`)
+  - MCPWM group: both motors on group 0 for synchronous timing
+  - Motor 1 pins: PWM A/B = GPIO4/5; Encoder A/B = GPIO36/35
+  - Motor 2 pins: PWM A/B = GPIO6/7; Encoder A/B = GPIO38/37
+- PCNT: two units configured for X4 quadrature with 500 ns glitch filter on both encoders
+- Tasks: two rotate tasks (`rotate5_fwd_m1`, `rotate5_fwd_m2`) run concurrently, 70% duty, 5 rev target
+- Logging: includes motor ID for clarity ("Motor 1", "Motor 2")
