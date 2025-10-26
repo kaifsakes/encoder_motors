@@ -1,0 +1,168 @@
+ENCODER MOTOR SETUP SPECIFICATIONS
+=====================================
+
+This document contains all the configuration details for the dual encoder motor setup
+implemented in the ESP32-S3 project. Use this information to replicate the same
+motor encoder configuration in other projects.
+
+PROJECT OVERVIEW
+================
+- Project Name: AGV_v2
+- Target Platform: ESP32-S3
+- Framework: ESP-IDF
+- Motor Type: Dual BDC (Brushed DC) Motors with Quadrature Encoders
+- Motor Driver: DRV8871 (Dual H-Bridge)
+- Control Method: MCPWM (Motor Control PWM)
+
+HARDWARE CONFIGURATION
+=======================
+
+ENCODER SPECIFICATIONS
+----------------------
+- Encoder Type: Quadrature Encoder (A/B channels)
+- Pulses Per Revolution (PPR): 1550
+- Decoding Method: X4 (4x counting for higher resolution)
+- Glitch Filter: 500ns (ignores pulses shorter than 500ns)
+
+MOTOR 1 ENCODER PINS
+--------------------
+- Encoder A Channel: GPIO 36
+- Encoder B Channel: GPIO 35
+
+MOTOR 2 ENCODER PINS
+--------------------
+- Encoder A Channel: GPIO 38
+- Encoder B Channel: GPIO 37
+
+MOTOR DRIVER CONFIGURATION
+==========================
+
+MOTOR 1 PWM PINS (DRV8871)
+--------------------------
+- PWM A: GPIO 4
+- PWM B: GPIO 5
+
+MOTOR 2 PWM PINS (DRV8871)
+--------------------------
+- PWM A: GPIO 6
+- PWM B: GPIO 7
+
+PWM CONFIGURATION
+=================
+- PWM Frequency: 25,000 Hz (25 kHz)
+- Timer Resolution: 10,000,000 Hz (10 MHz)
+- Maximum Duty Cycle Ticks: 400 (100% duty cycle)
+- Default Duty Cycle: 280 ticks (70% duty cycle)
+- MCPWM Group: 0 (both motors use same group for synchronous timing)
+
+SOFTWARE CONFIGURATION
+======================
+
+REQUIRED LIBRARIES AND DEPENDENCIES
+-----------------------------------
+1. ESP-IDF Core Libraries:
+   - freertos/FreeRTOS.h
+   - freertos/task.h
+   - esp_log.h
+   - driver/pulse_cnt.h
+   - driver/gpio.h
+   - esp_timer.h
+
+2. External Components (via idf_component.yml):
+   - bdc_motor: ^0.1.0
+   - pid_ctrl: ^0.1.1
+
+3. Standard C Libraries:
+   - stdio.h
+   - stdlib.h
+   - math.h
+
+PCNT (Pulse Counter) CONFIGURATION
+==================================
+- Counter Range: -32,768 to +32,767
+- Quadrature Decoding: X4 mode
+- Edge Actions:
+  * Channel A: Increase on rising, Decrease on falling
+  * Channel B: Decrease on rising, Increase on falling
+- Level Actions:
+  * Both channels: Keep on high, Inverse on low
+- Glitch Filter: 500ns maximum glitch duration
+
+MOTOR CONTROL PARAMETERS
+========================
+- Target Rotations: 5 complete rotations
+- Target Pulses: 7,750 (5 × 1550 PPR)
+- Control Loop Frequency: 100 Hz (10ms update interval)
+- Motor Direction: Forward only
+- Stop Method: Coast (no braking)
+
+TASK CONFIGURATION
+==================
+- Task Stack Size: 4096 bytes
+- Task Priority: 5
+- Task Names:
+  * Motor 1: "rotate5_fwd_m1"
+  * Motor 2: "rotate5_fwd_m2"
+
+IMPLEMENTATION DETAILS
+======================
+
+ENCODER SETUP SEQUENCE
+----------------------
+1. Create PCNT unit with specified limits
+2. Configure channel A with edge and level actions
+3. Configure channel B with opposite edge actions for X4 decoding
+4. Apply glitch filter (500ns)
+5. Enable, clear, and start the PCNT unit
+
+MOTOR SETUP SEQUENCE
+--------------------
+1. Configure BDC motor with PWM frequency and GPIO pins
+2. Configure MCPWM with group ID and resolution
+3. Create MCPWM device
+4. Enable motor
+
+CONTROL ALGORITHM
+=================
+1. Clear encoder count to zero
+2. Set motor speed to specified duty cycle
+3. Start motor in forward direction
+4. Monitor encoder count every 10ms
+5. Calculate rotations: count / PPR
+6. Stop motor when target reached (5 rotations or 7,750 pulses)
+7. Set speed to 0 and coast motor
+8. Log final position
+
+LOGGING OUTPUT FORMAT
+=====================
+Motor X: count=XXXX rot=X.XX/5.00 (PPR=1550 target=7750)
+Motor X: Stopped at count=XXXX (~X.XX rotations, PPR=1550, target=7750)
+
+CRITICAL SETTINGS SUMMARY
+=========================
+- PPR: 1550
+- PWM Freq: 25 kHz
+- Timer Res: 10 MHz
+- Max Duty: 400 ticks
+- Default Duty: 280 ticks (70%)
+- Update Rate: 100 Hz
+- Glitch Filter: 500ns
+- Target: 5 rotations (7,750 pulses)
+- Counter Range: ±32,767
+
+GPIO ASSIGNMENTS SUMMARY
+========================
+Motor 1:
+- Encoder A: GPIO 36
+- Encoder B: GPIO 35
+- PWM A: GPIO 4
+- PWM B: GPIO 5
+
+Motor 2:
+- Encoder A: GPIO 38
+- Encoder B: GPIO 37
+- PWM A: GPIO 6
+- PWM B: GPIO 7
+
+This configuration provides precise position control with 1550 PPR encoders
+and 25 kHz PWM control for smooth motor operation.
