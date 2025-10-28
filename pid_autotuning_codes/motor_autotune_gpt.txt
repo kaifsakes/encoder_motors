@@ -1,0 +1,507 @@
+/*
+  ESP32-S3 4-motor Auto-Tuner (Arduino sketch)
+  - Uses PCNT for quadrature encoders.
+  - Uses ledc for PWM on two pins per motor (DRV8871 style IN1/IN2).
+  - Performs sweep, linear fit, step response, PID estimate, cross scaling.
+  - Outputs calibration to Serial and saves to NVS (Preferences).
+
+  Author: ChatGPT (pseudo-production sketch)
+*/
+
+#include <Arduino.h>
+#include <Preferences.h>
+#include <vector>
+#include "driver/pcnt.h"
+
+// --------------------------- User configuration (from you) ---------------------------
+const int PPR = 1550;
+const uint32_t PWM_FREQ = 25000;       // 25 kHz
+const uint32_t TIMER_RES_HZ = 10000000; // informational
+const uint16_t MAX_DUTY_TICKS = 400;
+const uint16_t DEFAULT_DUTY_TICKS = 280; // 70%
+const int16_t PCNT_HIGH_LIM = 32767;
+const int16_t PCNT_LOW_LIM  = -32768;
+
+const uint32_t SAMPLE_PERIOD_MS = 10;   // 100 Hz sampling
+const uint32_t SWEEP_DELAY_MS = 500;    // wait after setting duty to measure
+const float SWEEP_STEP_TICKS = 20.0;    // step size (in ticks) for sweep
+const uint32_t STEP_DURATION_MS = 2000; // step response duration
+const float STEP_TARGET_DUTY_TICKS = DEFAULT_DUTY_TICKS;
+const float DEADZONE_THRESHOLD_TPS = 5.0f;
+
+// Pin mapping (exactly as provided)
+const int ENC_A_PINS[4] = {1, 3, 5, 7};   // ENCODER A Motor 1..4
+const int ENC_B_PINS[4] = {2, 4, 6, 8};   // ENCODER B Motor 1..4
+const int M_PLUS_PINS[4] = {9, 11, 13, 15};   // M+ for Motor 1..4
+const int M_MINUS_PINS[4] = {10, 12, 14, 16}; // M- for Motor 1..4
+// ------------------------------------------------------------------------------------
+
+// ledc config: use 8 channels (2 per motor). 25kHz frequency. 12-bit resolution.
+const int LEDC_RESOLUTION = 12;
+const int LEDC_MAX_DUTY = (1 << LEDC_RESOLUTION) - 1;
+
+// map motor index to ledc channels
+const int LEDC_CH_A[4] = {0, 2, 4, 6}; // even channels for M+
+const int LEDC_CH_B[4] = {1, 3, 5, 7}; // odd channels for M-
+
+// PCNT units and channels (one unit per motor)
+pcnt_unit_handle_t pcnt_units[4] = { NULL, NULL, NULL, NULL };
+
+// calibration data structure
+struct MotorCalib {
+  // sweep samples
+  float pwm_samples[32];
+  float speed_samples[32]; // ticks/sec
+  int sample_count;
+
+  // linear fit
+  float a; // speed = a * pwm + b
+  float b;
+  float deadzone_t = 0;
+
+  // step response
+  float K;   // steady_ticks_per_sec per duty_fraction
+  float tau; // seconds
+
+  // PID estimates
+  float Kp;
+  float Ki;
+  float Kd;
+
+  // cross scaling
+  float scale;
+
+  float steady_speed; // ticks/sec at default duty
+};
+
+MotorCalib calib[4];
+
+// runtime counters and sampling
+volatile int32_t pcnt_last_snapshot[4] = {0};
+volatile int32_t pcnt_last_read[4] = {0};
+float motor_speed_tps[4] = {0}; // ticks per second (smoothed)
+float motor_speed_tps_ema[4] = {0};
+
+Preferences prefs;
+
+// --------------------------- Utility functions ---------------------------
+
+float ticksToRps(float ticks_per_sec) {
+  return ticks_per_sec / PPR; // revs per second
+}
+
+uint32_t ticksToLedcDuty(uint16_t ticks) {
+  // map 0..MAX_DUTY_TICKS to 0..LEDC_MAX_DUTY
+  if (ticks <= 0) return 0;
+  if (ticks >= MAX_DUTY_TICKS) return LEDC_MAX_DUTY;
+  return (uint32_t)((uint64_t)ticks * LEDC_MAX_DUTY / MAX_DUTY_TICKS);
+}
+
+void setMotorForwardPWM(int motorIdx, uint16_t dutyTicks) {
+  // forward: M+ = pwm, M- = 0
+  uint32_t d = ticksToLedcDuty(dutyTicks);
+  ledcWrite(LEDC_CH_A[motorIdx], d);
+  ledcWrite(LEDC_CH_B[motorIdx], 0);
+}
+void setMotorReversePWM(int motorIdx, uint16_t dutyTicks) {
+  uint32_t d = ticksToLedcDuty(dutyTicks);
+  ledcWrite(LEDC_CH_A[motorIdx], 0);
+  ledcWrite(LEDC_CH_B[motorIdx], d);
+}
+void stopMotorPWM(int motorIdx) {
+  ledcWrite(LEDC_CH_A[motorIdx], 0);
+  ledcWrite(LEDC_CH_B[motorIdx], 0);
+}
+
+// --------------------------- PCNT helpers ---------------------------
+
+static void pcnt_unit_init_single(int idx, int pinA, int pinB) {
+  pcnt_unit_config_t unit_config = {
+    .high_limit = PCNT_HIGH_LIM,
+    .low_limit  = PCNT_LOW_LIM,
+  };
+  esp_err_t err = pcnt_new_unit(&unit_config, &pcnt_units[idx]);
+  if (err != ESP_OK) {
+    Serial.printf("PCNT new unit %d failed: %d\n", idx, err);
+    while (1) delay(1000);
+  }
+
+  pcnt_chan_config_t chan_a_cfg = {
+    .edge_gpio_num = pinA,
+    .level_gpio_num = pinB,
+  };
+  pcnt_channel_handle_t chan_a = NULL;
+  pcnt_new_channel(pcnt_units[idx], &chan_a_cfg, &chan_a);
+  pcnt_channel_set_edge_action(chan_a, PCNT_CHANNEL_EDGE_ACTION_INCREASE, PCNT_CHANNEL_EDGE_ACTION_DECREASE);
+  pcnt_channel_set_level_action(chan_a, PCNT_CHANNEL_LEVEL_ACTION_KEEP, PCNT_CHANNEL_LEVEL_ACTION_INVERSE);
+
+  pcnt_chan_config_t chan_b_cfg = {
+    .edge_gpio_num = pinB,
+    .level_gpio_num = pinA,
+  };
+  pcnt_channel_handle_t chan_b = NULL;
+  pcnt_new_channel(pcnt_units[idx], &chan_b_cfg, &chan_b);
+  pcnt_channel_set_edge_action(chan_b, PCNT_CHANNEL_EDGE_ACTION_DECREASE, PCNT_CHANNEL_EDGE_ACTION_INCREASE);
+  pcnt_channel_set_level_action(chan_b, PCNT_CHANNEL_LEVEL_ACTION_KEEP, PCNT_CHANNEL_LEVEL_ACTION_INVERSE);
+
+  pcnt_glitch_filter_config_t gf = {
+    .max_glitch_ns = 500, // configurable
+  };
+  pcnt_unit_set_glitch_filter(pcnt_units[idx], &gf);
+
+  pcnt_unit_enable(pcnt_units[idx]);
+  pcnt_unit_clear_count(pcnt_units[idx]);
+  pcnt_unit_start(pcnt_units[idx]);
+}
+
+int pcnt_get_and_clear(int idx) {
+  int32_t cnt = 0;
+  if (pcnt_unit_get_count(pcnt_units[idx], &cnt) == ESP_OK) {
+    pcnt_unit_clear_count(pcnt_units[idx]);
+    return cnt;
+  }
+  return 0;
+}
+
+// --------------------------- Sampling task ---------------------------
+
+TaskHandle_t samplingTaskHandle = NULL;
+volatile bool samplingRunning = false;
+
+void samplingTask(void *pv) {
+  const float alpha = 0.25f; // EMA smoothing factor
+  const TickType_t period = pdMS_TO_TICKS(SAMPLE_PERIOD_MS);
+  while (samplingRunning) {
+    int32_t counts[4];
+    for (int i=0;i<4;i++){
+      int32_t c = 0;
+      pcnt_unit_get_count(pcnt_units[i], &c); // read but don't clear here
+      counts[i] = c;
+    }
+    // compute deltas vs last read
+    for (int i=0;i<4;i++){
+      int32_t delta = counts[i] - pcnt_last_read[i];
+      pcnt_last_read[i] = counts[i];
+      float tps = (float)delta / (SAMPLE_PERIOD_MS / 1000.0f); // ticks per second
+      // EMA
+      motor_speed_tps_ema[i] = alpha * tps + (1.0f - alpha) * motor_speed_tps_ema[i];
+      motor_speed_tps[i] = motor_speed_tps_ema[i];
+    }
+    vTaskDelay(period);
+  }
+  vTaskDelete(NULL);
+}
+
+// --------------------------- Math helpers ---------------------------
+
+void linear_fit(float *x, float *y, int n, float &a, float &b) {
+  if (n <= 1) { a = 0; b = 0; return; }
+  double sx=0, sy=0, sxx=0, sxy=0;
+  for (int i=0;i<n;i++){
+    sx += x[i];
+    sy += y[i];
+    sxx += (double)x[i]*x[i];
+    sxy += (double)x[i]*y[i];
+  }
+  double N = n;
+  double denom = N * sxx - sx*sx;
+  if (fabs(denom) < 1e-9) { a = 0; b = sy / N; return; }
+  a = (N * sxy - sx * sy) / denom;
+  b = (sy - a * sx) / N;
+}
+
+// find time when speed reaches frac * steady in log (log recorded samples)
+float find_time_to_fraction(const std::vector<std::pair<float,float>>& log, float frac) {
+  // log: vector of (t_ms, speed)
+  float target = log.back().second * frac;
+  for (size_t i=0;i<log.size(); ++i) {
+    if (log[i].second >= target) {
+      return log[i].first / 1000.0f; // seconds
+    }
+  }
+  return log.back().first / 1000.0f; // fallback
+}
+
+// --------------------------- Tuning routines ---------------------------
+
+void perform_pwm_sweep(int idx) {
+  Serial.printf("Motor %d: PWM sweep start\n", idx+1);
+  MotorCalib &m = calib[idx];
+  m.sample_count = 0;
+
+  // small safety: ensure encoder cleared
+  pcnt_unit_clear_count(pcnt_units[idx]);
+  delay(50);
+
+  for (float ticks = 0.0f; ticks <= (float)DEFAULT_DUTY_TICKS + 1.0f; ticks += SWEEP_STEP_TICKS) {
+    // set forward PWM (we assume forward direction)
+    setMotorForwardPWM(idx, (uint16_t)round(ticks));
+    delay(SWEEP_DELAY_MS);
+
+    // measure average over last 200 ms
+    const int samples = max(1, (int)(200 / SAMPLE_PERIOD_MS));
+    float sum = 0;
+    for (int s=0;s<samples;s++){
+      sum += motor_speed_tps[idx];
+      delay(SAMPLE_PERIOD_MS);
+    }
+    float avg = sum / samples; // ticks/sec
+
+    if (m.sample_count < (int)sizeof(m.pwm_samples)/sizeof(m.pwm_samples[0])) {
+      m.pwm_samples[m.sample_count] = ticks;
+      m.speed_samples[m.sample_count] = avg;
+      m.sample_count++;
+    } else break;
+  }
+
+  stopMotorPWM(idx);
+  delay(100);
+
+  // find deadzone: first pwm where speed exceeds small threshold
+  float thr = 5.0f; // 5 ticks/sec threshold
+  m.deadzone_t = 0;
+  for (int i=0;i<m.sample_count;i++) {
+    if (m.speed_samples[i] > thr) { m.deadzone_t = m.pwm_samples[i]; break; }
+  }
+  Serial.printf("Motor %d: PWM sweep done samples=%d deadzone=%.1f\n", idx+1, m.sample_count, m.deadzone_t);
+}
+
+void compute_linear_fit_for(int idx) {
+  MotorCalib &m = calib[idx];
+  linear_fit(m.pwm_samples, m.speed_samples, m.sample_count, m.a, m.b);
+  Serial.printf("Motor %d: linear fit: speed = %.6f * pwm + %.3f (units: ticks/sec)\n", idx+1, m.a, m.b);
+}
+
+void perform_step_response(int idx) {
+  Serial.printf("Motor %d: step response start\n", idx+1);
+  MotorCalib &m = calib[idx];
+
+  // clear encoder
+  pcnt_unit_clear_count(pcnt_units[idx]);
+  delay(50);
+
+  // start step
+  setMotorForwardPWM(idx, (uint16_t)STEP_TARGET_DUTY_TICKS);
+  std::vector<std::pair<float,float>> log; log.reserve(STEP_DURATION_MS / SAMPLE_PERIOD_MS + 10);
+  uint32_t t0 = millis();
+  while (millis() - t0 < STEP_DURATION_MS) {
+    float t = (float)(millis() - t0);
+    float spd = motor_speed_tps[idx];
+    log.push_back({t, spd});
+    delay(SAMPLE_PERIOD_MS);
+  }
+  stopMotorPWM(idx);
+  delay(100);
+
+  // steady is mean of last 300 ms samples
+  int lastSamples = max(1, (int)(300 / SAMPLE_PERIOD_MS));
+  float sum = 0;
+  for (int i = (int)log.size() - lastSamples; i < (int)log.size(); ++i) {
+    if (i >= 0) sum += log[i].second;
+  }
+  float steady = sum / lastSamples;
+  m.steady_speed = steady;
+
+  // find time to 63% of steady
+  float t63 = find_time_to_fraction(log, 0.63f);
+  m.tau = max( (float)1e-3, t63 ); // seconds
+  // gain: steady ticks/sec per duty fraction (duty fraction = ticks/MAX_DUTY_TICKS)
+  float duty_frac = STEP_TARGET_DUTY_TICKS / (float)MAX_DUTY_TICKS;
+  m.K = (duty_frac > 0) ? (steady / duty_frac) : 0.0f;
+
+  Serial.printf("Motor %d: step done steady=%.2f tps, tau=%.3f s, K=%.3f (tps per duty-frac)\n", idx+1, steady, m.tau, m.K);
+}
+
+void compute_pid_from_identified(int idx) {
+  MotorCalib &m = calib[idx];
+  float Tc = SAMPLE_PERIOD_MS / 1000.0f;
+  if (m.K == 0 || m.tau == 0) {
+    m.Kp = 0; m.Ki = 0; m.Kd = 0;
+    return;
+  }
+  // Use a heuristic formula (from earlier notes)
+  m.Kp = (0.9f * m.tau) / (m.K * Tc);
+  m.Ki = 0.27f / (m.K * Tc);
+  m.Kd = 0.0f;
+  Serial.printf("Motor %d: estimated PID Kp=%.4f Ki=%.4f Kd=%.4f\n", idx+1, m.Kp, m.Ki, m.Kd);
+}
+
+void perform_cross_motor_scaling() {
+  Serial.println("Cross-motor scaling: running all motors at default duty...");
+  // clear encoders
+  for (int i=0;i<4;i++) pcnt_unit_clear_count(pcnt_units[i]);
+  delay(50);
+  // run all forward
+  for (int i=0;i<4;i++) setMotorForwardPWM(i, DEFAULT_DUTY_TICKS);
+  delay(1000); // let reach steady
+  // measure average over 500ms
+  const int samples = max(1, (int)(500 / SAMPLE_PERIOD_MS));
+  float speeds[4] = {0};
+  for (int s=0;s<samples;s++) {
+    for (int i=0;i<4;i++) speeds[i] += motor_speed_tps[i];
+    delay(SAMPLE_PERIOD_MS);
+  }
+  for (int i=0;i<4;i++) speeds[i] /= samples;
+
+  float mean = 0;
+  for (int i=0;i<4;i++) mean += speeds[i];
+  mean /= 4.0f;
+  for (int i=0;i<4;i++) {
+    calib[i].scale = (speeds[i] > 1e-3f) ? (mean / speeds[i]) : 1.0f;
+    Serial.printf("Motor %d: speed=%.2f tps scale=%.4f\n", i+1, speeds[i], calib[i].scale);
+  }
+  stopMotorPWM(0); stopMotorPWM(1); stopMotorPWM(2); stopMotorPWM(3);
+  delay(100);
+}
+
+// --------------------------- Save/Load ---------------------------
+void save_calibration() {
+  prefs.begin("motorcal", false);
+  for (int i=0;i<4;i++) {
+    prefs.putBytes(String("m") + i, &calib[i], sizeof(MotorCalib));
+  }
+  prefs.end();
+  Serial.println("Calibration saved to NVS.");
+}
+
+bool load_calibration() {
+  prefs.begin("motorcal", true);
+  bool ok = true;
+  for (int i=0;i<4;i++) {
+    size_t sz = prefs.getBytesLength(String("m") + i);
+    if (sz == sizeof(MotorCalib)) {
+      prefs.getBytes(String("m") + i, &calib[i], sizeof(MotorCalib));
+      Serial.printf("Loaded calibration for motor %d from NVS.\n", i+1);
+    } else {
+      ok = false;
+      break;
+    }
+  }
+  prefs.end();
+  return ok;
+}
+
+// --------------------------- Main auto-tune controller ---------------------------
+void run_autotune_all() {
+  Serial.println("=== AUTOTUNE START ===");
+
+  // step 1: sweep each motor
+  for (int i=0;i<4;i++) {
+    perform_pwm_sweep(i);
+    compute_linear_fit_for(i);
+    perform_step_response(i);
+    compute_pid_from_identified(i);
+  }
+
+  // step 2: cross motor scaling
+  perform_cross_motor_scaling();
+
+  // step 3: report
+  Serial.println("\n==== AUTO TUNE COMPLETE ====");
+  Serial.println("Motor | a | b | deadzone | K | tau(s) | Kp | Ki | Kd | scale | steady_tps");
+  for (int i=0;i<4;i++) {
+    Serial.printf("%d | %.6f | %.3f | %.1f | %.3f | %.3f | %.4f | %.4f | %.4f | %.4f | %.2f\n",
+                  i+1,
+                  calib[i].a, calib[i].b, calib[i].deadzone_t,
+                  calib[i].K, calib[i].tau,
+                  calib[i].Kp, calib[i].Ki, calib[i].Kd,
+                  calib[i].scale, calib[i].steady_speed);
+  }
+
+  // save to NVS
+  save_calibration();
+  Serial.println("=== AUTOTUNE FINISHED ===");
+}
+
+// --------------------------- Setup / loop ---------------------------
+
+void setup_peripherals() {
+  // setup ledc PWM channels
+  ledcSetup(LEDC_CH_A[0], PWM_FREQ, LEDC_RESOLUTION);
+  ledcSetup(LEDC_CH_A[1], PWM_FREQ, LEDC_RESOLUTION);
+  ledcSetup(LEDC_CH_A[2], PWM_FREQ, LEDC_RESOLUTION);
+  ledcSetup(LEDC_CH_A[3], PWM_FREQ, LEDC_RESOLUTION);
+
+  ledcSetup(LEDC_CH_B[0], PWM_FREQ, LEDC_RESOLUTION);
+  ledcSetup(LEDC_CH_B[1], PWM_FREQ, LEDC_RESOLUTION);
+  ledcSetup(LEDC_CH_B[2], PWM_FREQ, LEDC_RESOLUTION);
+  ledcSetup(LEDC_CH_B[3], PWM_FREQ, LEDC_RESOLUTION);
+
+  // attach pins
+  for (int i=0;i<4;i++){
+    ledcAttachPin(M_PLUS_PINS[i], LEDC_CH_A[i]);
+    ledcAttachPin(M_MINUS_PINS[i], LEDC_CH_B[i]);
+    // start with 0 duty
+    stopMotorPWM(i);
+  }
+
+  // setup pcnt for each encoder
+  for (int i=0;i<4;i++) {
+    pcnt_unit_init_single(i, ENC_A_PINS[i], ENC_B_PINS[i]);
+    pcnt_last_read[i] = 0;
+    motor_speed_tps_ema[i] = 0;
+    motor_speed_tps[i] = 0;
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  Serial.println("\nESP32-S3 4-motor Auto-Tuner starting...");
+
+  // initialize prefs
+  prefs.begin("motorcal", false);
+  prefs.end();
+
+  setup_peripherals();
+
+  // start sampling task
+  samplingRunning = true;
+  xTaskCreatePinnedToCore(samplingTask, "samplingTask", 4096, NULL, 2, &samplingTaskHandle, 0);
+  delay(200);
+
+  // Allow user to decide: press any key within 3s to skip autotune (load existing)
+  Serial.println("Press any key within 3 seconds to load existing calibration instead of running autotune.");
+  uint32_t t0 = millis();
+  bool loadExisting = false;
+  while (millis() - t0 < 3000) {
+    if (Serial.available()) {
+      loadExisting = true;
+      break;
+    }
+    delay(10);
+  }
+
+  if (loadExisting && load_calibration()) {
+    Serial.println("Loaded existing calibration. Done.");
+  } else {
+    run_autotune_all();
+  }
+
+  Serial.println("Tuner: entering idle. Send 'export' to reprint table, 'save' to store, 'run' to re-run autotune.");
+}
+
+void loop() {
+  // simple serial commands
+  if (Serial.available()) {
+    String cmd = Serial.readStringUntil('\n');
+    cmd.trim();
+    if (cmd.equalsIgnoreCase("run")) {
+      run_autotune_all();
+    } else if (cmd.equalsIgnoreCase("export")) {
+      Serial.println("\n==== EXPORTED CALIBRATION ====");
+      for (int i=0;i<4;i++) {
+        Serial.printf("M%d a=%.6f b=%.3f deadzone=%.1f K=%.3f tau=%.3f Kp=%.4f Ki=%.4f Kd=%.4f scale=%.4f steady=%.2f\n",
+                      i+1, calib[i].a, calib[i].b, calib[i].deadzone_t, calib[i].K, calib[i].tau,
+                      calib[i].Kp, calib[i].Ki, calib[i].Kd, calib[i].scale, calib[i].steady_speed);
+      }
+    } else if (cmd.equalsIgnoreCase("save")) {
+      save_calibration();
+    } else if (cmd.equalsIgnoreCase("stop")) {
+      for (int i=0;i<4;i++) stopMotorPWM(i);
+    } else {
+      Serial.printf("Unknown cmd '%s'\n", cmd.c_str());
+    }
+  }
+  delay(100);
+}

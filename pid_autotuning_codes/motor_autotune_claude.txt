@@ -1,0 +1,470 @@
+/*
+ * ESP32-S3 Motor Auto-Tuning Firmware
+ * 4-Motor System with Encoders
+ * 
+ * Hardware:
+ * - 4x Motors with DRV8871 drivers
+ * - 1550 PPR Encoders
+ * - 25kHz PWM, 10MHz Timer Resolution
+ * 
+ * Required Libraries:
+ * - ESP32Encoder (install via Library Manager)
+ * - Preferences (built-in)
+ */
+
+#include <ESP32Encoder.h>
+#include <Preferences.h>
+
+// ==================== CONFIGURATION ====================
+#define NUM_MOTORS 4
+#define ENCODER_PPR 1550
+#define PWM_FREQ 25000        // 25kHz
+#define PWM_RESOLUTION 10     // 10-bit resolution for 400 ticks at 25kHz
+#define TIMER_RES_HZ 10000000 // 10MHz
+#define MAX_DUTY 400
+#define DEFAULT_DUTY 280      // 70%
+#define SAMPLE_PERIOD_MS 20   // 20ms sampling
+#define SWEEP_STEP 0.05       // 5% duty steps
+#define STEP_RESPONSE_DUTY 0.7
+#define STEP_RESPONSE_DURATION_MS 2000
+
+// Motor pin definitions
+struct MotorPins {
+  int pin_mplus;
+  int pin_mminus;
+  int pin_encA;
+  int pin_encB;
+  int pwm_channel_plus;
+  int pwm_channel_minus;
+};
+
+MotorPins motors[NUM_MOTORS] = {
+  {9, 10, 1, 2, 0, 1},   // Motor 1
+  {11, 12, 3, 4, 2, 3},  // Motor 2
+  {13, 14, 5, 6, 4, 5},  // Motor 3
+  {15, 16, 7, 8, 6, 7}   // Motor 4
+};
+
+// Calibration data structure
+struct MotorCalib {
+  float pwm_vals[32];
+  float speed_vals[32];
+  int sample_count;
+  
+  float a, b;              // Linear model: speed = a*pwm + b
+  float deadzone;          // Minimum PWM for motion
+  float K;                 // System gain
+  float tau;               // Time constant
+  float Kp, Ki, Kd;        // PID gains
+  float scale;             // Cross-motor scaling
+  float steady_state_speed;
+};
+
+// Global variables
+ESP32Encoder encoders[NUM_MOTORS];
+MotorCalib calib[NUM_MOTORS];
+float motor_speed_rps[NUM_MOTORS] = {0};
+int64_t last_encoder_count[NUM_MOTORS] = {0};
+unsigned long last_sample_time = 0;
+Preferences preferences;
+
+// ==================== SETUP ====================
+void setup() {
+  Serial.begin(115200);
+  while (!Serial && millis() < 3000); // Wait for serial or 3s timeout
+  
+  Serial.println("\n\n========================================");
+  Serial.println("ESP32-S3 Motor Auto-Tuning Firmware");
+  Serial.println("========================================\n");
+  
+  initializePeripherals();
+  
+  Serial.println("Starting auto-tuning sequence...\n");
+  delay(1000);
+  
+  // Auto-tune each motor
+  for (int i = 0; i < NUM_MOTORS; i++) {
+    Serial.printf("\n>>> TUNING MOTOR %d <<<\n", i + 1);
+    
+    performPWMSweep(i);
+    computeLinearFit(i);
+    performStepResponse(i);
+    computePIDGains(i);
+    
+    delay(500);
+  }
+  
+  // Cross-motor scaling
+  performCrossMotorScaling();
+  
+  // Report and save
+  reportResults();
+  saveToNVS();
+  
+  Serial.println("\n========================================");
+  Serial.println("AUTO-TUNING COMPLETE!");
+  Serial.println("Results saved to flash memory.");
+  Serial.println("========================================\n");
+}
+
+// ==================== MAIN LOOP ====================
+void loop() {
+  // Update speed measurements
+  if (millis() - last_sample_time >= SAMPLE_PERIOD_MS) {
+    updateMotorSpeeds();
+    last_sample_time = millis();
+  }
+  
+  // Idle - tuning is done in setup()
+  delay(1000);
+}
+
+// ==================== INITIALIZATION ====================
+void initializePeripherals() {
+  Serial.println("Initializing peripherals...");
+  
+  // Configure PWM channels
+  for (int i = 0; i < NUM_MOTORS; i++) {
+    // Configure PWM for M+ pin
+    ledcSetup(motors[i].pwm_channel_plus, PWM_FREQ, PWM_RESOLUTION);
+    ledcAttachPin(motors[i].pin_mplus, motors[i].pwm_channel_plus);
+    ledcWrite(motors[i].pwm_channel_plus, 0);
+    
+    // Configure PWM for M- pin
+    ledcSetup(motors[i].pwm_channel_minus, PWM_FREQ, PWM_RESOLUTION);
+    ledcAttachPin(motors[i].pin_mminus, motors[i].pwm_channel_minus);
+    ledcWrite(motors[i].pwm_channel_minus, 0);
+    
+    // Configure encoder
+    ESP32Encoder::useInternalWeakPullResistors = UP;
+    encoders[i].attachFullQuad(motors[i].pin_encA, motors[i].pin_encB);
+    encoders[i].clearCount();
+    encoders[i].setFilter(1023); // Glitch filter
+    
+    last_encoder_count[i] = 0;
+    
+    Serial.printf("  Motor %d: M+=%d, M-=%d, EA=%d, EB=%d, PWM_CH=%d,%d\n",
+                  i + 1,
+                  motors[i].pin_mplus, motors[i].pin_mminus,
+                  motors[i].pin_encA, motors[i].pin_encB,
+                  motors[i].pwm_channel_plus, motors[i].pwm_channel_minus);
+  }
+  
+  last_sample_time = millis();
+  Serial.println("Peripherals initialized.\n");
+}
+
+// ==================== MOTOR CONTROL ====================
+void setMotorPWM(int motor_idx, float duty, bool forward) {
+  if (motor_idx < 0 || motor_idx >= NUM_MOTORS) return;
+  if (duty < 0.0) duty = 0.0;
+  if (duty > 1.0) duty = 1.0;
+  
+  int duty_ticks = (int)(duty * MAX_DUTY);
+  
+  if (forward) {
+    ledcWrite(motors[motor_idx].pwm_channel_plus, duty_ticks);
+    ledcWrite(motors[motor_idx].pwm_channel_minus, 0);
+  } else {
+    ledcWrite(motors[motor_idx].pwm_channel_plus, 0);
+    ledcWrite(motors[motor_idx].pwm_channel_minus, duty_ticks);
+  }
+}
+
+void stopMotor(int motor_idx) {
+  if (motor_idx < 0 || motor_idx >= NUM_MOTORS) return;
+  
+  ledcWrite(motors[motor_idx].pwm_channel_plus, 0);
+  ledcWrite(motors[motor_idx].pwm_channel_minus, 0);
+}
+
+void stopAllMotors() {
+  for (int i = 0; i < NUM_MOTORS; i++) {
+    stopMotor(i);
+  }
+}
+
+// ==================== SPEED MEASUREMENT ====================
+void updateMotorSpeeds() {
+  for (int i = 0; i < NUM_MOTORS; i++) {
+    int64_t current_count = encoders[i].getCount();
+    int64_t delta = current_count - last_encoder_count[i];
+    last_encoder_count[i] = current_count;
+    
+    // Speed in RPS (revolutions per second)
+    float dt = SAMPLE_PERIOD_MS / 1000.0;
+    motor_speed_rps[i] = (float)delta / ENCODER_PPR / dt;
+  }
+}
+
+float getAverageSpeed(int motor_idx, int duration_ms) {
+  unsigned long start_time = millis();
+  float sum = 0.0;
+  int count = 0;
+  
+  while (millis() - start_time < duration_ms) {
+    if (millis() - last_sample_time >= SAMPLE_PERIOD_MS) {
+      updateMotorSpeeds();
+      last_sample_time = millis();
+      sum += fabs(motor_speed_rps[motor_idx]);
+      count++;
+    }
+  }
+  
+  return count > 0 ? sum / count : 0.0;
+}
+
+// ==================== PWM SWEEP ====================
+void performPWMSweep(int motor_idx) {
+  Serial.printf("  [1/4] PWM Sweep...\n");
+  
+  encoders[motor_idx].clearCount();
+  last_encoder_count[motor_idx] = 0;
+  calib[motor_idx].sample_count = 0;
+  
+  for (float duty = 0.0; duty <= 1.0; duty += SWEEP_STEP) {
+    setMotorPWM(motor_idx, duty, true);
+    delay(500); // Settling time
+    
+    float speed = getAverageSpeed(motor_idx, 200);
+    
+    int idx = calib[motor_idx].sample_count;
+    calib[motor_idx].pwm_vals[idx] = duty;
+    calib[motor_idx].speed_vals[idx] = speed;
+    calib[motor_idx].sample_count++;
+    
+    Serial.printf("    PWM: %.2f -> Speed: %.3f RPS\n", duty, speed);
+  }
+  
+  stopMotor(motor_idx);
+  
+  // Detect deadzone
+  calib[motor_idx].deadzone = 0.0;
+  for (int i = 0; i < calib[motor_idx].sample_count; i++) {
+    if (calib[motor_idx].speed_vals[i] > 0.05) { // 0.05 RPS threshold
+      calib[motor_idx].deadzone = calib[motor_idx].pwm_vals[i];
+      break;
+    }
+  }
+  
+  Serial.printf("    Deadzone detected at: %.3f\n", calib[motor_idx].deadzone);
+}
+
+// ==================== LINEAR FIT ====================
+void computeLinearFit(int motor_idx) {
+  Serial.printf("  [2/4] Computing linear model...\n");
+  
+  int N = calib[motor_idx].sample_count;
+  float sum_x = 0, sum_y = 0, sum_x2 = 0, sum_xy = 0;
+  
+  for (int i = 0; i < N; i++) {
+    float x = calib[motor_idx].pwm_vals[i];
+    float y = calib[motor_idx].speed_vals[i];
+    sum_x += x;
+    sum_y += y;
+    sum_x2 += x * x;
+    sum_xy += x * y;
+  }
+  
+  float a = (N * sum_xy - sum_x * sum_y) / (N * sum_x2 - sum_x * sum_x);
+  float b = (sum_y - a * sum_x) / N;
+  
+  calib[motor_idx].a = a;
+  calib[motor_idx].b = b;
+  
+  Serial.printf("    Model: speed = %.3f * pwm + %.3f\n", a, b);
+}
+
+// ==================== STEP RESPONSE ====================
+void performStepResponse(int motor_idx) {
+  Serial.printf("  [3/4] Step response test...\n");
+  
+  encoders[motor_idx].clearCount();
+  last_encoder_count[motor_idx] = 0;
+  motor_speed_rps[motor_idx] = 0;
+  
+  stopMotor(motor_idx);
+  delay(200);
+  
+  // Apply step input
+  unsigned long start_time = millis();
+  setMotorPWM(motor_idx, STEP_RESPONSE_DUTY, true);
+  
+  float speed_log[200];
+  int time_log[200];
+  int log_count = 0;
+  
+  while (millis() - start_time < STEP_RESPONSE_DURATION_MS && log_count < 200) {
+    if (millis() - last_sample_time >= SAMPLE_PERIOD_MS) {
+      updateMotorSpeeds();
+      last_sample_time = millis();
+      
+      speed_log[log_count] = fabs(motor_speed_rps[motor_idx]);
+      time_log[log_count] = millis() - start_time;
+      log_count++;
+    }
+  }
+  
+  stopMotor(motor_idx);
+  
+  // Calculate steady-state (average of last 300ms)
+  int samples_300ms = 300 / SAMPLE_PERIOD_MS;
+  float sum = 0;
+  int count = 0;
+  for (int i = max(0, log_count - samples_300ms); i < log_count; i++) {
+    sum += speed_log[i];
+    count++;
+  }
+  float steady = count > 0 ? sum / count : 0;
+  
+  // Find 63% rise time (tau)
+  float threshold_63 = 0.63 * steady;
+  int tau_ms = 0;
+  for (int i = 0; i < log_count; i++) {
+    if (speed_log[i] >= threshold_63) {
+      tau_ms = time_log[i];
+      break;
+    }
+  }
+  
+  float K = steady / STEP_RESPONSE_DUTY;
+  float tau_sec = tau_ms / 1000.0;
+  
+  calib[motor_idx].K = K;
+  calib[motor_idx].tau = tau_sec;
+  calib[motor_idx].steady_state_speed = steady;
+  
+  Serial.printf("    Steady-state speed: %.3f RPS\n", steady);
+  Serial.printf("    Gain (K): %.3f\n", K);
+  Serial.printf("    Time constant (τ): %.3f s\n", tau_sec);
+}
+
+// ==================== PID TUNING ====================
+void computePIDGains(int motor_idx) {
+  Serial.printf("  [4/4] Computing PID gains (Cohen-Coon)...\n");
+  
+  float Tc = SAMPLE_PERIOD_MS / 1000.0;
+  float K = calib[motor_idx].K;
+  float tau = calib[motor_idx].tau;
+  
+  if (K == 0 || tau == 0) {
+    Serial.println("    Warning: Invalid K or tau, using default gains");
+    calib[motor_idx].Kp = 0.5;
+    calib[motor_idx].Ki = 0.1;
+    calib[motor_idx].Kd = 0.0;
+    return;
+  }
+  
+  // Cohen-Coon tuning
+  float Kp = (0.9 * tau) / (K * Tc);
+  float Ki = 0.27 / (K * Tc);
+  float Kd = 0.0; // Start with no derivative
+  
+  calib[motor_idx].Kp = Kp;
+  calib[motor_idx].Ki = Ki;
+  calib[motor_idx].Kd = Kd;
+  
+  Serial.printf("    Kp: %.4f\n", Kp);
+  Serial.printf("    Ki: %.4f\n", Ki);
+  Serial.printf("    Kd: %.4f\n", Kd);
+}
+
+// ==================== CROSS-MOTOR SCALING ====================
+void performCrossMotorScaling() {
+  Serial.println("\n>>> CROSS-MOTOR SCALING <<<");
+  Serial.println("Running all motors at 70% duty...");
+  
+  // Run all motors
+  for (int i = 0; i < NUM_MOTORS; i++) {
+    setMotorPWM(i, STEP_RESPONSE_DUTY, true);
+    encoders[i].clearCount();
+    last_encoder_count[i] = 0;
+  }
+  
+  delay(1000); // Let them stabilize
+  
+  // Measure steady speeds
+  float speeds[NUM_MOTORS];
+  for (int i = 0; i < NUM_MOTORS; i++) {
+    speeds[i] = getAverageSpeed(i, 500);
+    Serial.printf("  Motor %d: %.3f RPS\n", i + 1, speeds[i]);
+  }
+  
+  // Calculate average speed
+  float avg_speed = 0;
+  for (int i = 0; i < NUM_MOTORS; i++) {
+    avg_speed += speeds[i];
+  }
+  avg_speed /= NUM_MOTORS;
+  
+  // Calculate scaling factors
+  Serial.printf("\nAverage speed: %.3f RPS\n", avg_speed);
+  Serial.println("Scaling factors:");
+  for (int i = 0; i < NUM_MOTORS; i++) {
+    calib[i].scale = speeds[i] > 0 ? avg_speed / speeds[i] : 1.0;
+    Serial.printf("  Motor %d: %.4f\n", i + 1, calib[i].scale);
+  }
+  
+  stopAllMotors();
+}
+
+// ==================== RESULTS REPORTING ====================
+void reportResults() {
+  Serial.println("\n========================================");
+  Serial.println("AUTO-TUNE RESULTS");
+  Serial.println("========================================");
+  Serial.println("Motor | a      | b      | Dead  | K     | τ(s)  | Kp    | Ki    | Kd    | Scale");
+  Serial.println("------|--------|--------|-------|-------|-------|-------|-------|-------|------");
+  
+  for (int i = 0; i < NUM_MOTORS; i++) {
+    Serial.printf("  %d   | %6.3f | %6.3f | %.3f | %5.2f | %.3f | %5.2f | %5.2f | %5.2f | %.3f\n",
+                  i + 1,
+                  calib[i].a,
+                  calib[i].b,
+                  calib[i].deadzone,
+                  calib[i].K,
+                  calib[i].tau,
+                  calib[i].Kp,
+                  calib[i].Ki,
+                  calib[i].Kd,
+                  calib[i].scale);
+  }
+  Serial.println("========================================\n");
+}
+
+// ==================== NVS STORAGE ====================
+void saveToNVS() {
+  Serial.println("Saving calibration to flash...");
+  
+  preferences.begin("motor_calib", false);
+  
+  for (int i = 0; i < NUM_MOTORS; i++) {
+    char key[16];
+    snprintf(key, sizeof(key), "motor_%d", i);
+    preferences.putBytes(key, &calib[i], sizeof(MotorCalib));
+  }
+  
+  preferences.end();
+  Serial.println("Calibration saved successfully.\n");
+}
+
+bool loadFromNVS() {
+  preferences.begin("motor_calib", true);
+  
+  bool success = true;
+  for (int i = 0; i < NUM_MOTORS; i++) {
+    char key[16];
+    snprintf(key, sizeof(key), "motor_%d", i);
+    size_t len = preferences.getBytesLength(key);
+    
+    if (len != sizeof(MotorCalib)) {
+      success = false;
+      break;
+    }
+    
+    preferences.getBytes(key, &calib[i], sizeof(MotorCalib));
+  }
+  
+  preferences.end();
+  return success;
+}
